@@ -1,0 +1,9 @@
+Compact ICC Profiles
+Source: https://github.com/saucecontrol/Compact-ICC-Profiles
+Files: profiles/DisplayP3-v4.icc, profiles/sRGB-v4.icc
+License: CC0-1.0
+
+PySocks 1.7.1
+Source: https://pypi.org/project/PySocks/1.7.1/
+File: wheels/PySocks-1.7.1-py3-none-any.whl
+License: BSD

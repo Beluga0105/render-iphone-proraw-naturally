@@ -1,0 +1,6 @@
+interface:
+  display_name: "Natural iPhone ProRAW"
+  short_description: "自然显影并完成可直接分享的 iPhone ProRAW 成片"
+  default_prompt: "使用 $render-iphone-proraw-naturally 诊断、自然显影并完成这张 Apple ProRAW DNG，输出可直接分享的 JPEG、16-bit TIFF 和诊断报告。"
+policy:
+  allow_implicit_invocation: true
