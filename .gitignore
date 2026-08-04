@@ -7,5 +7,19 @@ output/
 validation-output/
 natural-camera-output/
 
+# Source and rendered photos
 *.dng
+*.DNG
+*.heic
+*.HEIC
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
 *.tif
+*.tiff
+*.TIF
+*.TIFF
+
+# Generated diagnostic reports
+*-diagnostic.json
