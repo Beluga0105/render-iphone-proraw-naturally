@@ -139,7 +139,7 @@ photo-natural-standard-social-diagnostic.json
 - **TIFF：** 完成版 16-bit Display P3 母版
 - **诊断 JSON：** 相机元数据、ProRAW 标签摘要、显影决策、亮度统计、饱和度统计和 `quality_check`
 
-原始 DNG 保持不变。输出先写入临时文件，只有完整处理成功后才正式发布到目标目录。
+原始 DNG 保持不变。输出先写入临时文件，只有完整处理成功后才正式发布到目标目录。在 macOS 上，发布过程会清除原子临时文件可能遗留的隐藏标志，确保 JPEG、TIFF 和 JSON 在 Finder 中正常可见。
 
 ## 隐私与内容完整性
 

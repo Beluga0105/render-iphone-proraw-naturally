@@ -139,7 +139,7 @@ photo-natural-standard-social-diagnostic.json
 - **TIFF:** finished 16-bit Display P3 master
 - **Diagnostic JSON:** camera metadata, ProRAW tag summaries, rendering decision, luminance statistics, saturation statistics, and `quality_check`
 
-The original DNG remains unchanged. Output files are written through temporary files and published only after the render completes.
+The original DNG remains unchanged. Output files are written through temporary files and published only after the render completes. On macOS, the publisher clears any hidden-file flag inherited from its atomic temporary files so JPEG, TIFF, and JSON results remain visible in Finder.
 
 ## Privacy and Content Integrity
 

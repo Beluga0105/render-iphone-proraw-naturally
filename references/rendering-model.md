@@ -82,6 +82,8 @@ Install the exact versions in `scripts/requirements.lock` into a per-platform vi
 
 Official rawpy wheels used by this runtime cover macOS arm64, Windows x86-64, and Linux x86-64/aarch64. LibRaw lists DNG and Apple iPhone 15 Pro support. Reject unsupported platforms or newer formats rather than using a preview fallback.
 
+Write each output to a same-directory temporary path and atomically replace the final path only after encoding succeeds. On macOS, clear `UF_HIDDEN` before and after the rename because Finder can preserve that flag from a dot-prefixed temporary file. This visibility repair is a no-op on platforms without `chflags` and must not alter image bytes or metadata.
+
 ## Third-party assets
 
 The compact Display P3 and sRGB ICC profiles come from `saucecontrol/Compact-ICC-Profiles` and are released under CC0-1.0. The bundled PySocks wheel is version 1.7.1 and is distributed under the BSD license. Neither asset contains Capture One data.

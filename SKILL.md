@@ -63,7 +63,7 @@ The default `auto` run selects a concrete preset, applies the `social` finish, a
 - `<stem>-natural-standard-social-16bit-P3.tif`: finished 16-bit Display P3 TIFF.
 - `<stem>-natural-standard-social-diagnostic.json`: structured ProRAW diagnostic, strength decision, finish method, exposure check, and saturation statistics.
 
-The concrete strength and finish replace `standard-social` when another choice is selected. The original DNG must remain byte-for-byte unchanged. The runner writes all outputs through temporary files and publishes them only after they are complete.
+The concrete strength and finish replace `standard-social` when another choice is selected. The original DNG must remain byte-for-byte unchanged. The runner writes all outputs through temporary files and publishes them only after they are complete. Published files must be visible in Finder and other file managers; on macOS the runner clears any `UF_HIDDEN` flag inherited from its dot-prefixed atomic temporary files.
 
 The runner checks the final encoded JPEG with a full-image luminance histogram and reports black clipping, deep-shadow coverage, bright-highlight coverage, white clipping, and 1st/50th/99th-percentile luma. See [references/rendering-model.md](references/rendering-model.md) for thresholds.
 

@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
@@ -512,6 +513,29 @@ def _temp_path(output_dir: Path, suffix: str) -> Path:
     return path
 
 
+def _clear_platform_hidden_flag(path: Path) -> None:
+    """Keep atomically published outputs visible in Finder on macOS.
+
+    macOS can attach UF_HIDDEN to a dot-prefixed temporary file and preserve the
+    flag when that file is renamed. Other supported platforms do not expose
+    chflags/UF_HIDDEN, so this is intentionally a no-op there.
+    """
+    if not hasattr(os, "chflags") or not hasattr(stat, "UF_HIDDEN"):
+        return
+    current_flags = os.stat(path, follow_symlinks=False).st_flags
+    hidden_flag = stat.UF_HIDDEN
+    if current_flags & hidden_flag:
+        os.chflags(path, current_flags & ~hidden_flag, follow_symlinks=False)
+
+
+def _publish_visible(temporary: Path, destination: Path) -> None:
+    # Clear the inherited flag before rename, then verify the destination too.
+    # The rename remains atomic because both paths are in the output directory.
+    _clear_platform_hidden_flag(temporary)
+    os.replace(temporary, destination)
+    _clear_platform_hidden_flag(destination)
+
+
 def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: str, overwrite: bool, keep_gps: bool) -> dict[str, Any]:
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
         raise RenderError("Only Apple ProRAW .dng inputs are accepted; JPEG and HEIC are not RAW inputs.")
@@ -607,9 +631,9 @@ def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: s
             encoding="utf-8",
         )
 
-        os.replace(tiff_temp, tiff_path)
-        os.replace(jpeg_temp, jpeg_path)
-        os.replace(diagnostic_temp, diagnostic_path)
+        _publish_visible(tiff_temp, tiff_path)
+        _publish_visible(jpeg_temp, jpeg_path)
+        _publish_visible(diagnostic_temp, diagnostic_path)
     except Exception:
         for temporary in (jpeg_temp, tiff_temp, diagnostic_temp):
             try:
@@ -658,7 +682,7 @@ def _diagnose_one(path: Path, output_dir: Path, overwrite: bool) -> dict[str, An
     temporary = _temp_path(output_dir, ".json")
     try:
         temporary.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, report_path)
+        _publish_visible(temporary, report_path)
     except Exception:
         try:
             temporary.unlink()
