@@ -1,6 +1,6 @@
 ---
 name: render-iphone-proraw-naturally
-description: Deterministically diagnose, develop, finish, and exposure-check Apple iPhone ProRAW DNG photos into a natural, social-media-ready rendering without Capture One or generative editing. Use when the user asks to inspect DNG diagnostics; reduce the Apple computational-photography look; restore natural color after neutralization; produce a finished photo ready to share; compare against a Capture One reference; or export sRGB JPEG and 16-bit Display P3 TIFF. Trigger on Chinese requests such as 去除苹果计算摄影感、自然显影 ProRAW、恢复颜色、直接出片、社交媒体成片、相机质感、胶片标准曲线, and related English requests.
+description: Deterministically diagnose, develop, finish, and exposure-check Apple iPhone ProRAW DNG photos into a natural rendering without generative editing. Use when an AI coding agent needs to inspect DNG diagnostics; reduce the Apple computational-photography look; restore natural color after neutralization; produce a finished photo; compare against a reference rendering; or export sRGB JPEG and 16-bit Display P3 TIFF. Trigger on Chinese requests such as 去除苹果计算摄影感、自然显影 ProRAW、恢复颜色、直接出片、相机质感、胶片标准曲线, and related English requests.
 ---
 
 # Natural iPhone ProRAW
@@ -15,13 +15,23 @@ Develop Apple ProRAW with a deterministic two-stage pipeline: create a restraine
    - `light`: use airier middle tones and slightly fuller color.
    - `standard`: use the calibrated natural-camera S-curve default.
    - `strong`: use denser shadows and more restrained color without crushing midtones.
-3. Run from the skill directory:
+3. Resolve the skill directory before running the bundled scripts.
+   - In Claude Code, use `${CLAUDE_SKILL_DIR}`. Claude Code expands it to the directory containing this `SKILL.md`.
+   - In Codex or another compatible host, locate the directory containing this `SKILL.md` and run from that directory.
+
+In Claude Code, run:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scripts/run.py" "/absolute/path/photo.dng"
+```
+
+In Codex or from a terminal already opened in the skill directory, run:
 
 ```bash
 python3 scripts/run.py "/absolute/path/photo.dng"
 ```
 
-Use `py -3 scripts/run.py ...` on Windows when `python3` is not an available command.
+Use `py -3 scripts/run.py ...` on Windows when `python3` is not an available command. In Claude Code on Windows, use `py -3 "${CLAUDE_SKILL_DIR}/scripts/run.py" ...`.
 
 The default `--finish social` applies restrained perceptual vibrance and hue-preserving sRGB gamut compression after neutralization. Use `--finish neutral` only when the user explicitly wants a conservative base for further editing.
 

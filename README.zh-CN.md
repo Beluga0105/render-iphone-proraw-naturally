@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-一个用于 Codex 的确定性 iPhone ProRAW 显影 skill：不使用生成式编辑，将 Apple iPhone ProRAW DNG 处理为自然、克制的成片。
+一个同时适用于 Codex 与 Claude Code 的确定性 iPhone ProRAW 显影 skill：不使用生成式编辑，将 Apple iPhone ProRAW DNG 处理为自然、克制的成片。
 
 可调用的 skill 名称是 `render-iphone-proraw-naturally`。
 
@@ -35,7 +35,9 @@
 
 ## 安装
 
-把公开仓库直接克隆到 Codex skills 目录：
+### Codex
+
+把公开仓库克隆到 Codex skills 目录：
 
 ```bash
 git clone https://github.com/Beluga0105/render-iphone-proraw-naturally.git \
@@ -44,9 +46,22 @@ git clone https://github.com/Beluga0105/render-iphone-proraw-naturally.git \
 
 如果 skill 没有立即出现，请重启 Codex。
 
+### Claude Code
+
+把同一个仓库克隆到 Claude Code 的个人 skills 目录：
+
+```bash
+git clone https://github.com/Beluga0105/render-iphone-proraw-naturally.git \
+  ~/.claude/skills/render-iphone-proraw-naturally
+```
+
+Claude Code 会直接读取同一份 `SKILL.md`，调用方式是 `/render-iphone-proraw-naturally`。只有在新建的顶层 skills 目录没有被识别时才需要重启 Claude Code。
+
 首次显影需要联网。内置启动脚本会创建隔离的 `.runtime` 环境，并安装 `scripts/requirements.lock` 中锁定的依赖版本。
 
-## 在 Codex 中使用
+## 在 Codex 和 Claude Code 中使用
+
+### Codex
 
 调用 skill 名称，并附上 Apple iPhone ProRAW `.dng` 文件：
 
@@ -58,7 +73,15 @@ git clone https://github.com/Beluga0105/render-iphone-proraw-naturally.git \
 使用 $render-iphone-proraw-naturally 诊断并自然显影这张 DNG，给我 JPEG、16-bit TIFF 和诊断报告。
 ```
 
-Codex 应返回 JPEG、TIFF 和诊断 JSON 的可点击路径，并说明最终强度、完成方式、相机型号规则置信度、质量检查状态和警告。
+### Claude Code
+
+使用斜杠命令传入 DNG 路径，或在当前会话中附上文件：
+
+```text
+/render-iphone-proraw-naturally /绝对路径/photo.dng
+```
+
+两个平台都应返回 JPEG、TIFF 和诊断 JSON 的路径，并说明最终强度、完成方式、相机型号规则置信度、质量检查状态和警告。
 
 ## 命令行使用
 
@@ -144,8 +167,8 @@ JPEG 和 HEIC 不能代替 RAW 输入。
 
 ## 仓库结构
 
-- `SKILL.md`：Codex 工作流与验收规则
-- `agents/openai.yaml`：Codex 界面元数据
+- `SKILL.md`：Codex 与 Claude Code 共用的工作流和验收规则
+- `agents/openai.yaml`：Codex 界面元数据；Claude Code 会安全忽略
 - `scripts/`：运行环境启动、诊断、RAW 显影管线和入口脚本
 - `references/rendering-model.md`：显影模型、阈值和技术决策
 - `assets/profiles/`：内嵌 sRGB 与 Display P3 ICC 配置文件
