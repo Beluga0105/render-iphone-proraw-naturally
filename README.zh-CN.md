@@ -176,4 +176,6 @@ JPEG 和 HEIC 不能代替 RAW 输入。
 
 ## 许可
 
-仓库目前尚未添加开源许可证。在选择许可证之前，仓库可以公开浏览，但没有向他人授予复制、修改或再分发代码的一般许可。
+本项目采用 [MIT License](LICENSE)。
+
+第三方组件继续适用其原始许可证，详见 [THIRD_PARTY_NOTICES.txt](assets/THIRD_PARTY_NOTICES.txt)。

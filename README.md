@@ -176,4 +176,6 @@ JPEG and HEIC files are not accepted as substitutes for RAW input.
 
 ## License
 
-No open-source license has been added yet. Until a license is selected, the repository remains publicly viewable but does not grant general permission to copy, modify, or redistribute the code.
+This project is licensed under the [MIT License](LICENSE).
+
+Third-party components retain their original licenses. See [THIRD_PARTY_NOTICES.txt](assets/THIRD_PARTY_NOTICES.txt).
