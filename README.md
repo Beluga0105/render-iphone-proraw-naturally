@@ -121,9 +121,10 @@ Useful options:
 --overwrite
 --keep-gps
 --diagnose-only
+--finalize
 ```
 
-Without `--overwrite`, existing results are preserved and new files receive `-v2`, `-v3`, and later suffixes.
+Without `--finalize`, renders are comparison candidates. Existing results are preserved and new files receive `-v2`, `-v3`, and later suffixes. After visual acceptance, rerun the chosen strength and finish with `--finalize`; this publishes one canonical JPEG + TIFF + JSON group and removes only recognized outputs for the same source stem.
 
 ## Output
 
@@ -139,7 +140,7 @@ photo-natural-standard-social-diagnostic.json
 - **TIFF:** finished 16-bit Display P3 master
 - **Diagnostic JSON:** camera metadata, ProRAW tag summaries, rendering decision, luminance statistics, saturation statistics, and `quality_check`
 
-The original DNG remains unchanged. Output files are written through temporary files and published only after the render completes. On macOS, the publisher clears any hidden-file flag inherited from its atomic temporary files so JPEG, TIFF, and JSON results remain visible in Finder.
+The original DNG remains unchanged. Output files are written through non-dot-prefixed temporary files and published only after the render completes. On macOS, the publisher clears and verifies the absence of `UF_HIDDEN`; the render fails instead of reporting success if a final output remains hidden in Finder.
 
 ## Privacy and Content Integrity
 
