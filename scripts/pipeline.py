@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -82,6 +83,23 @@ CONTRAST_TOE_PIVOT = 0.55
 CONTRAST_BLEND_START = 0.35
 CONTRAST_BLEND_END = 0.65
 CONTRAST_MAX_GAMMA = 1.70
+MIDTONE_MIN_PREVIEW_P50 = 0.25
+MIDTONE_MIN_GAP = 0.06
+MIDTONE_MIN_SPAN = 0.75
+MIDTONE_MIN_P99 = 0.80
+MIDTONE_PREVIEW_BLEND = 0.70
+MIDTONE_PREVIEW_MARGIN = 0.035
+MIDTONE_MAX_ABSOLUTE_LIFT = 0.17
+MIDTONE_BASELINE_MAX_EV = 0.75
+MIDTONE_BASELINE_WEIGHT = 0.65
+MIDTONE_MAX_GAIN = 4.0
+MIDTONE_SHADOW_START = 0.015
+MIDTONE_SHADOW_END = 0.12
+MIDTONE_HIGHLIGHT_START = 0.60
+MIDTONE_HIGHLIGHT_END = 0.97
+MIDTONE_SEARCH_STEPS = 18
+MIDTONE_UNDEREXPOSURE_RATIO = 0.75
+MIDTONE_UNDEREXPOSURE_GAP = 0.08
 
 
 class RenderError(RuntimeError):
@@ -247,11 +265,15 @@ def _apply_finish_inplace(encoded_p3: np.ndarray, finish: FinishPreset) -> None:
         np.clip(block, 0.0, 1.0, out=block)
 
 
-def _sample_luma_percentiles(rgb: np.ndarray, weights: np.ndarray) -> dict[str, float]:
+def _sample_luma_values(rgb: np.ndarray, weights: np.ndarray) -> np.ndarray:
     height, width = rgb.shape[:2]
     stride = max(1, int(math.sqrt((height * width) / CONTRAST_SAMPLE_PIXELS)))
     sampled = rgb[::stride, ::stride].astype(np.float32, copy=False)
-    luma = np.sum(sampled * weights, axis=2)
+    return np.sum(sampled * weights, axis=2)
+
+
+def _sample_luma_percentiles(rgb: np.ndarray, weights: np.ndarray) -> dict[str, float]:
+    luma = _sample_luma_values(rgb, weights)
     p01, p50, p99 = np.percentile(luma, (1.0, 50.0, 99.0))
     return {
         "p01": round(float(p01), 6),
@@ -279,6 +301,128 @@ def _embedded_preview_contrast(raw: rawpy.RawPy) -> dict[str, Any]:
         return {"available": True, "role": "global_tone_reference_only", "metrics": metrics}
     except (rawpy.LibRawError, OSError, UnidentifiedImageError, ValueError, TypeError) as exc:
         return {"available": False, "role": "global_tone_reference_only", "error": str(exc)}
+
+
+def _smoothstep(values: np.ndarray) -> np.ndarray:
+    values = np.clip(values, 0.0, 1.0)
+    return values * values * (3.0 - 2.0 * values)
+
+
+def _midtone_lift_luma(luma: np.ndarray, gain: float) -> np.ndarray:
+    lifted = np.divide(
+        gain * luma,
+        1.0 + (gain - 1.0) * luma,
+    )
+    shadow_gate = _smoothstep(
+        (luma - MIDTONE_SHADOW_START) / (MIDTONE_SHADOW_END - MIDTONE_SHADOW_START)
+    )
+    highlight_gate = 1.0 - _smoothstep(
+        (luma - MIDTONE_HIGHLIGHT_START) / (MIDTONE_HIGHLIGHT_END - MIDTONE_HIGHLIGHT_START)
+    )
+    return luma + (lifted - luma) * shadow_gate * highlight_gate
+
+
+def _adapt_scene_midtones_inplace(
+    encoded_p3: np.ndarray,
+    preview_contrast: dict[str, Any],
+    baseline_exposure_ev: float | None,
+) -> dict[str, Any]:
+    before = _sample_luma_percentiles(encoded_p3, P3_LUMA)
+    report: dict[str, Any] = {
+        "method": "preview_guided_global_midtone_lift",
+        "applied": False,
+        "preview": preview_contrast,
+        "before": before,
+    }
+    if not preview_contrast.get("available"):
+        report["reason"] = "embedded_preview_unavailable"
+        report["after"] = before
+        return report
+
+    reference = preview_contrast["metrics"]
+    reference_p50 = float(reference["p50"])
+    current_p50 = float(before["p50"])
+    current_p99 = float(before["p99"])
+    current_span = float(before["span_p01_p99"])
+    gap = reference_p50 - current_p50
+    positive_baseline_ev = float(np.clip(
+        max(float(baseline_exposure_ev or 0.0), 0.0),
+        0.0,
+        MIDTONE_BASELINE_MAX_EV,
+    ))
+    preview_target = current_p50 + max(gap, 0.0) * MIDTONE_PREVIEW_BLEND
+    baseline_target = current_p50 * (2.0 ** (positive_baseline_ev * MIDTONE_BASELINE_WEIGHT))
+    target_p50 = min(
+        reference_p50 - MIDTONE_PREVIEW_MARGIN,
+        current_p50 + MIDTONE_MAX_ABSOLUTE_LIFT,
+        max(preview_target, baseline_target),
+    )
+    target_p50 = max(current_p50, target_p50)
+    report["decision"] = {
+        "reference_p50": round(reference_p50, 6),
+        "current_p50": round(current_p50, 6),
+        "gap": round(gap, 6),
+        "baseline_exposure_ev": None if baseline_exposure_ev is None else round(float(baseline_exposure_ev), 6),
+        "positive_baseline_ev_used": round(positive_baseline_ev, 6),
+        "preview_target_p50": round(preview_target, 6),
+        "baseline_target_p50": round(baseline_target, 6),
+        "selected_target_p50": round(target_p50, 6),
+        "minimum_preview_p50": MIDTONE_MIN_PREVIEW_P50,
+        "minimum_gap": MIDTONE_MIN_GAP,
+        "minimum_span": MIDTONE_MIN_SPAN,
+        "minimum_p99": MIDTONE_MIN_P99,
+        "maximum_absolute_lift": MIDTONE_MAX_ABSOLUTE_LIFT,
+    }
+
+    if reference_p50 < MIDTONE_MIN_PREVIEW_P50:
+        report["reason"] = "reference_scene_is_dark"
+        report["after"] = before
+        return report
+    if gap < MIDTONE_MIN_GAP:
+        report["reason"] = "midtone_already_open"
+        report["after"] = before
+        return report
+    if current_span < MIDTONE_MIN_SPAN or current_p99 < MIDTONE_MIN_P99:
+        report["reason"] = "scene_not_bright_high_contrast"
+        report["after"] = before
+        return report
+    if target_p50 <= current_p50 + 1e-4:
+        report["reason"] = "no_safe_midtone_lift"
+        report["after"] = before
+        return report
+
+    sampled_luma = _sample_luma_values(encoded_p3, P3_LUMA)
+    maximum_median = float(np.percentile(_midtone_lift_luma(sampled_luma, MIDTONE_MAX_GAIN), 50.0))
+    achievable_target = min(target_p50, maximum_median)
+    low_gain = 1.0
+    high_gain = MIDTONE_MAX_GAIN
+    for _ in range(MIDTONE_SEARCH_STEPS):
+        candidate_gain = (low_gain + high_gain) * 0.5
+        candidate_median = float(np.percentile(
+            _midtone_lift_luma(sampled_luma, candidate_gain),
+            50.0,
+        ))
+        if candidate_median < achievable_target:
+            low_gain = candidate_gain
+        else:
+            high_gain = candidate_gain
+    gain = high_gain
+
+    height = encoded_p3.shape[0]
+    for start in range(0, height, CHUNK_ROWS):
+        block = encoded_p3[start:start + CHUNK_ROWS]
+        luma = np.sum(block * P3_LUMA, axis=2, keepdims=True)
+        target_luma = _midtone_lift_luma(luma, gain)
+        block *= np.divide(target_luma, np.maximum(luma, 1e-6))
+        np.clip(block, 0.0, 1.0, out=block)
+
+    report["applied"] = True
+    report["reason"] = "bright_high_contrast_scene_with_dense_midtones"
+    report["gain"] = round(gain, 6)
+    report["maximum_achievable_p50"] = round(maximum_median, 6)
+    report["target_limited_by_curve"] = maximum_median < target_p50
+    report["after"] = _sample_luma_percentiles(encoded_p3, P3_LUMA)
+    return report
 
 
 def _preserve_scene_contrast_inplace(
@@ -384,7 +528,10 @@ def _histogram_percentile(histogram: np.ndarray, percentile: float) -> int:
     return int(np.searchsorted(np.cumsum(histogram), target, side="left"))
 
 
-def _analyze_final_jpeg(path: Path) -> dict[str, Any]:
+def _analyze_final_jpeg(
+    path: Path,
+    midtone_adaptation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Measure final encoded pixels without relying on scene-aware enhancement."""
     with Image.open(path) as image:
         pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
@@ -438,6 +585,25 @@ def _analyze_final_jpeg(path: Path) -> dict[str, Any]:
         warnings.append(
             "possible_highlight_clipping: inspect bright areas for lost texture before delivery"
         )
+    if midtone_adaptation and midtone_adaptation.get("preview", {}).get("available"):
+        reference_p50 = float(midtone_adaptation["preview"]["metrics"]["p50"])
+        final_p50 = float(metrics["luma_percentiles_8bit"]["p50"]) / 255.0
+        midtone_gap = reference_p50 - final_p50
+        midtone_ratio = final_p50 / max(reference_p50, 1e-6)
+        metrics["scene_midtone_reference"] = {
+            "preview_p50": round(reference_p50, 6),
+            "final_p50": round(final_p50, 6),
+            "gap": round(midtone_gap, 6),
+            "ratio": round(midtone_ratio, 6),
+        }
+        if (
+            reference_p50 >= MIDTONE_MIN_PREVIEW_P50
+            and midtone_gap >= MIDTONE_UNDEREXPOSURE_GAP
+            and midtone_ratio <= MIDTONE_UNDEREXPOSURE_RATIO
+        ):
+            warnings.append(
+                "possible_global_underexposure: rendered midtones remain much darker than the global preview reference"
+            )
 
     return {
         "status": "review_required" if warnings else "pass",
@@ -505,8 +671,42 @@ def _versioned_outputs(output_dir: Path, stem: str, strength: str, finish: str, 
         suffix = f"-v{version}"
 
 
+def _canonical_outputs(output_dir: Path, stem: str, strength: str, finish: str) -> tuple[Path, Path, Path]:
+    return (
+        output_dir / f"{stem}-natural-{strength}-{finish}-sRGB.jpg",
+        output_dir / f"{stem}-natural-{strength}-{finish}-16bit-P3.tif",
+        output_dir / f"{stem}-natural-{strength}-{finish}-diagnostic.json",
+    )
+
+
+def _remove_other_outputs(
+    output_dir: Path,
+    stem: str,
+    keep: tuple[Path, Path, Path],
+) -> list[str]:
+    strengths = "|".join(re.escape(value) for value in sorted(PRESETS))
+    finishes = "|".join(re.escape(value) for value in sorted(FINISH_PRESETS))
+    rendered = re.compile(
+        rf"^{re.escape(stem)}-natural-(?:{strengths})-(?:{finishes})"
+        rf"(?:-v\d+)?-(?:sRGB\.jpg|16bit-P3\.tif|diagnostic\.json)$"
+    )
+    diagnose_only = re.compile(rf"^{re.escape(stem)}-proraw-diagnostic(?:-v\d+)?\.json$")
+    keep_paths = {path.resolve() for path in keep}
+    removed: list[str] = []
+    for candidate in sorted(output_dir.iterdir()):
+        if not candidate.is_file() or candidate.resolve() in keep_paths:
+            continue
+        if not rendered.fullmatch(candidate.name) and not diagnose_only.fullmatch(candidate.name):
+            continue
+        candidate.unlink()
+        removed.append(str(candidate))
+    return removed
+
+
 def _temp_path(output_dir: Path, suffix: str) -> Path:
-    descriptor, name = tempfile.mkstemp(prefix=".natural-camera-", suffix=suffix, dir=output_dir)
+    # Dot-prefixed temporary names can acquire UF_HIDDEN on macOS and retain
+    # it after an atomic rename. Avoid creating that Finder state at all.
+    descriptor, name = tempfile.mkstemp(prefix="natural-camera-tmp-", suffix=suffix, dir=output_dir)
     os.close(descriptor)
     path = Path(name)
     path.unlink()
@@ -534,9 +734,23 @@ def _publish_visible(temporary: Path, destination: Path) -> None:
     _clear_platform_hidden_flag(temporary)
     os.replace(temporary, destination)
     _clear_platform_hidden_flag(destination)
+    if (
+        hasattr(os, "chflags")
+        and hasattr(stat, "UF_HIDDEN")
+        and os.stat(destination, follow_symlinks=False).st_flags & stat.UF_HIDDEN
+    ):
+        raise OSError(f"Published output remains hidden: {destination}")
 
 
-def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: str, overwrite: bool, keep_gps: bool) -> dict[str, Any]:
+def _render_one(
+    path: Path,
+    output_dir: Path,
+    requested_strength: str,
+    finish: str,
+    overwrite: bool,
+    keep_gps: bool,
+    finalize: bool,
+) -> dict[str, Any]:
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
         raise RenderError("Only Apple ProRAW .dng inputs are accepted; JPEG and HEIC are not RAW inputs.")
     source_hash_before = _sha256(path)
@@ -558,6 +772,10 @@ def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: s
         "selected": finish,
         "social_ready": finish == "social",
         "method": "global_perceptual_vibrance_and_gamut_compression" if finish == "social" else "neutral_base_only",
+    }
+    diagnostic["publication"] = {
+        "mode": "final" if finalize else "candidate",
+        "cleanup_other_variants": finalize,
     }
 
     try:
@@ -583,12 +801,31 @@ def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: s
     for start in range(0, encoded_p3.shape[0], CHUNK_ROWS):
         _srgb_oetf_inplace(encoded_p3[start:start + CHUNK_ROWS])
     _apply_look_inplace(encoded_p3, PRESETS[strength])
+    baseline_exposure = diagnostic.get("baseline_exposure", {})
+    baseline_exposure_ev = (
+        baseline_exposure.get("ev") if baseline_exposure.get("present") else None
+    )
+    midtone_adaptation = _adapt_scene_midtones_inplace(
+        encoded_p3,
+        preview_contrast,
+        baseline_exposure_ev,
+    )
     contrast_preservation = _preserve_scene_contrast_inplace(encoded_p3, preview_contrast)
     _apply_finish_inplace(encoded_p3, FINISH_PRESETS[finish])
+    diagnostic["midtone_adaptation"] = midtone_adaptation
     diagnostic["scene_contrast_preservation"] = contrast_preservation
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    jpeg_path, tiff_path, diagnostic_path = _versioned_outputs(output_dir, path.stem, strength, finish, overwrite)
+    if finalize:
+        jpeg_path, tiff_path, diagnostic_path = _canonical_outputs(output_dir, path.stem, strength, finish)
+    else:
+        jpeg_path, tiff_path, diagnostic_path = _versioned_outputs(
+            output_dir,
+            path.stem,
+            strength,
+            finish,
+            overwrite,
+        )
     jpeg_temp = _temp_path(output_dir, ".jpg")
     tiff_temp = _temp_path(output_dir, ".tif")
     diagnostic_temp = _temp_path(output_dir, ".json")
@@ -621,7 +858,7 @@ def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: s
             save_args["exif"] = exif_bytes
         image.save(jpeg_temp, **save_args)
 
-        quality_check = _analyze_final_jpeg(jpeg_temp)
+        quality_check = _analyze_final_jpeg(jpeg_temp, midtone_adaptation)
 
         diagnostic["source"] = str(path)
         diagnostic["source_sha256"] = source_hash_before
@@ -646,6 +883,14 @@ def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: s
     if source_hash_before != source_hash_after:
         raise RenderError("The source DNG changed during rendering; outputs must not be trusted.")
 
+    removed_candidates: list[str] = []
+    if finalize:
+        removed_candidates = _remove_other_outputs(
+            output_dir,
+            path.stem,
+            (jpeg_path, tiff_path, diagnostic_path),
+        )
+
     return {
         "ok": True,
         "source": str(path),
@@ -656,6 +901,10 @@ def _render_one(path: Path, output_dir: Path, requested_strength: str, finish: s
         "camera": {"make": metadata.get("Make"), "model": metadata.get("Model")},
         "diagnostic": diagnostic,
         "quality_check": quality_check,
+        "publication": {
+            "mode": "final" if finalize else "candidate",
+            "removed_candidates": removed_candidates,
+        },
         "outputs": {"jpeg": str(jpeg_path), "tiff": str(tiff_path), "diagnostic": str(diagnostic_path)},
     }
 
@@ -732,7 +981,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--keep-gps", action="store_true")
     parser.add_argument("--diagnose-only", action="store_true", help="Write the ProRAW metadata report without rendering images")
-    return parser.parse_args()
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help="Publish this rendering as the sole final JPEG/TIFF/JSON group and delete other recognized outputs for the same source stem",
+    )
+    args = parser.parse_args()
+    if args.finalize and args.diagnose_only:
+        parser.error("--finalize cannot be combined with --diagnose-only")
+    return args
 
 
 def main() -> int:
@@ -751,7 +1008,15 @@ def main() -> int:
             if args.diagnose_only:
                 result = _diagnose_one(path, output_dir, args.overwrite)
             else:
-                result = _render_one(path, output_dir, args.strength, args.finish, args.overwrite, args.keep_gps)
+                result = _render_one(
+                    path,
+                    output_dir,
+                    args.strength,
+                    args.finish,
+                    args.overwrite,
+                    args.keep_gps,
+                    args.finalize,
+                )
         except Exception as exc:
             result = {"ok": False, "source": str(path), "error": str(exc)}
         results.append(result)

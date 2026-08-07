@@ -11,7 +11,7 @@ Apple ProRAW is already a computational RAW format. The pipeline can reshape its
 - Decoder: rawpy 0.27.0 / LibRaw.
 - White balance: camera/as-shot.
 - Automatic white balance: off.
-- Exposure normalization: deterministic LibRaw global auto-bright at a 1% highlight threshold, followed by a fixed preset-level linear exposure bias and an optional global shadow anchor; no local or content-aware HDR adjustment.
+- Exposure normalization: deterministic LibRaw global auto-bright at a 1% highlight threshold, followed by a fixed preset-level linear exposure bias, an optional preview-guided global midtone lift, and an optional global shadow anchor; no local or content-aware HDR adjustment.
 - Highlight handling: blend.
 - Working data: 16-bit linear P3 D65.
 - Output encoding: standard sRGB transfer function.
@@ -28,6 +28,14 @@ All tone curves use x control points `[0.00, 0.08, 0.20, 0.45, 0.73, 0.90, 1.00]
 | strong | -0.450 | 0.110 | 1.000 | 0.000 | 1.045 | `[0.000, 0.012, 0.075, 0.335, 0.690, 0.890, 0.982]` |
 
 Apply the preset exposure bias in linear P3. After display encoding, compress high chroma around P3 luminance and apply brightness, contrast, and the tone curve to luminance rather than independently to RGB channels. Rescale RGB by the luminance ratio to preserve hue relationships. The `strong` curve deliberately restores lower-middle-tone density and highlight separation for scenes where the standard rendering still looks HDR-flat. Do not apply local operators.
+
+## Scene midtone adaptation
+
+Bright sky, cloud, or backlight can dominate LibRaw's global auto-bright decision and leave the photographed ground or foreground too dense even when highlights are intact. After the preset tone curve, compare the rendered global median luminance with the embedded preview's global median. Activate a deterministic luminance-only lift only when the preview median is at least `0.25`, the preview-to-render gap is at least `0.06`, the rendered P01-to-P99 span is at least `0.75`, and rendered P99 is at least `0.80`.
+
+Set the candidate target from 70% of the preview median gap and a bounded positive `BaselineExposure` contribution. Clamp positive metadata input to `0.75 EV`, use it only as an additional target signal, never let a negative value force darkening, keep the target at least `0.035` below the preview median, and cap absolute median lift at `0.17`. Solve a single global gain against sampled luminance. Preserve the toe with a smooth gate from `0.015` to `0.12`, fade the lift out from `0.60` to `0.97`, and cap gain at `4.0`. This opens dense midtones without copying preview pixels, applying local masks, or sacrificing the bright-sky shoulder.
+
+Record the preview and rendered percentiles, BaselineExposure contribution, selected target, gain, curve limit, activation reason, and before/after statistics in `midtone_adaptation`. Failure to read a preview is non-fatal and must result in no midtone adaptation.
 
 ## Scene contrast preservation
 
@@ -48,7 +56,7 @@ Before decoding pixels, traverse the root IFDs and nested SubIFDs and summarize 
 
 Absence is a valid result and must be represented as `present: false`. A present but malformed tag must be represented as unreadable and must not silently influence the strength decision.
 
-`--strength auto` is the default. Apply a model-specific override only when `MODEL_STRENGTH_RULES` contains a rule calibrated from real source/output pairs for the exact `UniqueCameraModel` hardware key. The currently calibrated `iPhone16,1` rule remains `standard`; therefore no additional adjustment is needed for the supplied iPhone 15 Pro samples. Unknown models use `standard`, set confidence to `fallback`, and require visual review. Treat unusually high or low `BaselineExposure` as a review warning only: it is scene-dependent metadata and must not independently force `strong` or `light`.
+`--strength auto` is the default. Apply a model-specific override only when `MODEL_STRENGTH_RULES` contains a rule calibrated from real source/output pairs for the exact `UniqueCameraModel` hardware key. The currently calibrated `iPhone16,1` rule remains `standard`; therefore no additional preset adjustment is needed for the supplied iPhone 15 Pro samples. Unknown models use `standard`, set confidence to `fallback`, and require visual review. Treat unusually high or low `BaselineExposure` as a review warning only: it is scene-dependent metadata and must not independently force `strong` or `light`. A bounded positive value may contribute to the global midtone target only when the preview and rendered global statistics independently identify a bright high-contrast scene.
 
 An explicit `--strength light|standard|strong` overrides the recommendation but the diagnostic still reports both values. Add new model rules only after visual calibration on multiple representative ProRAW files; never infer a permanent model rule from one scene.
 
@@ -74,7 +82,7 @@ Analyze the final encoded JPEG, not only the pre-compression array. Build a full
 
 Also build an 8-bit HSV-style saturation histogram for pixels above near-black and report its mean, 50th, 75th, and 90th percentiles. Use these values to detect unintended color loss or excessive color, but do not impose a universal pass threshold because naturally gray, misty, snowy, and night scenes can be correctly low in saturation.
 
-Set `quality_check.status` to `review_required` when black clipping is at least 1%, or when deep shadows cover at least 20% while median luma is at most 40, or when white clipping is at least 1%, or when bright highlights cover at least 5%. These thresholds are conservative review triggers, not automatic exposure verdicts. Always inspect whether important scene texture is lost; legitimate night scenes, silhouettes, snow, the sun, and specular reflections may cross the thresholds.
+Set `quality_check.status` to `review_required` when black clipping is at least 1%, or when deep shadows cover at least 20% while median luma is at most 40, or when white clipping is at least 1%, or when bright highlights cover at least 5%. Also require review when the final JPEG median remains at least `0.08` below the preview median and is no more than 75% of that reference in a scene whose preview median is at least `0.25`. Record the final-to-preview median gap and ratio in `scene_midtone_reference`. These thresholds are conservative review triggers, not automatic exposure verdicts. Always inspect whether important scene texture is lost; legitimate night scenes, silhouettes, snow, the sun, and specular reflections may cross the thresholds.
 
 ## Runtime dependencies
 
@@ -83,6 +91,8 @@ Install the exact versions in `scripts/requirements.lock` into a per-platform vi
 Official rawpy wheels used by this runtime cover macOS arm64, Windows x86-64, and Linux x86-64/aarch64. LibRaw lists DNG and Apple iPhone 15 Pro support. Reject unsupported platforms or newer formats rather than using a preview fallback.
 
 Write each output to a same-directory temporary path and atomically replace the final path only after encoding succeeds. On macOS, clear `UF_HIDDEN` before and after the rename because Finder can preserve that flag from a dot-prefixed temporary file. This visibility repair is a no-op on platforms without `chflags` and must not alter image bytes or metadata.
+
+Treat non-finalized renders as disposable candidates. After visual acceptance, rerun the selected preset with `--finalize`. Publish the canonical JPEG, TIFF, and diagnostic JSON first; verify the source hash; then remove only filenames that strictly match another recognized render or diagnose-only artifact for the same source stem in the same output directory. Never remove unrelated files, and never clean candidates after an incomplete or failed final render.
 
 ## Third-party assets
 

@@ -1,6 +1,6 @@
 ---
 name: render-iphone-proraw-naturally
-description: Deterministically diagnose, develop, finish, and exposure-check Apple iPhone ProRAW DNG photos into a natural rendering without generative editing. Use when an AI coding agent needs to inspect DNG diagnostics; reduce the Apple computational-photography look; restore natural color after neutralization; produce a finished photo; compare against a reference rendering; or export sRGB JPEG and 16-bit Display P3 TIFF. Trigger on Chinese requests such as 去除苹果计算摄影感、自然显影 ProRAW、恢复颜色、直接出片、相机质感、胶片标准曲线, and related English requests.
+description: Deterministically diagnose, develop, finish, and exposure-check Apple iPhone ProRAW DNG photos into a natural, social-media-ready rendering without Capture One or generative editing. Use when the user asks to inspect DNG diagnostics; reduce the Apple computational-photography look; restore natural color after neutralization; produce a finished photo ready to share; compare against a Capture One reference; or export sRGB JPEG and 16-bit Display P3 TIFF. Trigger on Chinese requests such as 去除苹果计算摄影感、自然显影 ProRAW、恢复颜色、直接出片、社交媒体成片、相机质感、胶片标准曲线, and related English requests.
 ---
 
 # Natural iPhone ProRAW
@@ -38,16 +38,17 @@ The default `--finish social` applies restrained perceptual vibrance and hue-pre
 Pass multiple files or directories for a batch. Directory inputs include only immediate `.dng` children.
 
 4. Use `--output-dir "/absolute/path"` only when the user names a destination. Otherwise accept the sibling `natural-camera-output` folder.
-5. Add `--overwrite` only when the user explicitly authorizes replacement. Otherwise the runner creates `-v2`, `-v3`, and so on.
+5. Keep comparison renders as temporary candidates. Without `--finalize`, the runner creates `-v2`, `-v3`, and so on when an equivalent filename exists. Never deliver a candidate as final.
 6. Add `--keep-gps` only when the user explicitly asks to retain location metadata. GPS is stripped by default.
 7. Read `quality_check` from the runner output. Treat `review_required` as a warning, not proof of a bad exposure; night scenes, silhouettes, snow, sun, and specular reflections can legitimately trigger it. A `pass` never replaces visual review.
 8. Read the diagnostic report. Confirm `BaselineExposure`, `ProfileToneCurve`, Hue/Sat map, and all three OpcodeList entries are either summarized or explicitly marked absent. Treat an unreadable present tag as a failure requiring explanation. Report whether the selected strength came from a calibrated model rule or the conservative fallback.
-9. Inspect `scene_contrast_preservation` and the final JPEG visually. Verify orientation, unchanged scene geometry and text, grounded blacks in naturally high-contrast scenes, visible shadow and highlight texture, open middle tones, clean color separation, sufficient color fullness for direct sharing, and smooth highlight roll-off. The DNG preview may guide only global black-point detection; output pixels must still come entirely from RAW decoding. Reject a floating-gray, muddy, crushed, neon, or uniformly HDR-bright rendering even when the histogram passes. Check the reported luminance and saturation percentiles as supporting evidence, not as universal targets.
+9. Inspect `midtone_adaptation`, `scene_contrast_preservation`, and the final JPEG visually. Verify orientation, unchanged scene geometry and text, grounded blacks in naturally high-contrast scenes, visible shadow and highlight texture, open middle tones, clean color separation, sufficient color fullness for direct sharing, and smooth highlight roll-off. The DNG preview may guide only global midtone and black-point targets; output pixels must still come entirely from RAW decoding. Reject a floating-gray, muddy, crushed, neon, or uniformly HDR-bright rendering even when the histogram passes. Check the reported luminance and saturation percentiles as supporting evidence, not as universal targets.
 10. If the user did not request a specific strength and the selected output has an unintended exposure problem:
    - For crushed or excessively dense shadows, render a `light` candidate and compare both JPEGs.
    - For clipped or excessively bright highlights, or when the standard rendering still has flattened light and shadow separation, render a `strong` candidate and compare both JPEGs.
    - Deliver only the better candidate. If neither is acceptable, report the limitation instead of claiming success.
-11. Report clickable absolute paths for the JPEG, TIFF, and diagnostic JSON; the selected strength and finish; whether the model rule was calibrated; the `quality_check` status; and any warnings.
+11. After visual acceptance, rerun the selected strength and finish with `--finalize`. This publishes one canonical JPEG + TIFF + diagnostic JSON group and deletes only recognized candidate/version/diagnose-only outputs for the same source stem. Cleanup occurs only after all three final files are complete and the source DNG hash is unchanged.
+12. Confirm `publication.mode` is `final`, inspect `removed_candidates`, and verify that exactly one JPEG + TIFF + diagnostic JSON group remains for each source. Report clickable absolute paths for those three files; the selected strength and finish; whether the model rule was calibrated; the `quality_check` status; and any warnings.
 
 For metadata inspection without rendering, run:
 
@@ -57,13 +58,13 @@ python3 scripts/run.py "/absolute/path/photo.dng" --diagnose-only
 
 ## Output contract
 
-The default `auto` run selects a concrete preset, applies the `social` finish, and creates:
+Candidate runs select a concrete preset, apply the requested finish, and may create versioned files for comparison. The accepted render must be rerun with `--finalize`, which leaves only:
 
 - `<stem>-natural-standard-social-sRGB.jpg`: finished 8-bit sRGB, JPEG quality 96.
 - `<stem>-natural-standard-social-16bit-P3.tif`: finished 16-bit Display P3 TIFF.
-- `<stem>-natural-standard-social-diagnostic.json`: structured ProRAW diagnostic, strength decision, finish method, exposure check, and saturation statistics.
+- `<stem>-natural-standard-social-diagnostic.json`: structured ProRAW diagnostic, strength decision, preview-guided global midtone decision, finish method, exposure check, and saturation statistics.
 
-The concrete strength and finish replace `standard-social` when another choice is selected. The original DNG must remain byte-for-byte unchanged. The runner writes all outputs through temporary files and publishes them only after they are complete. Published files must be visible in Finder and other file managers; on macOS the runner clears any `UF_HIDDEN` flag inherited from its dot-prefixed atomic temporary files.
+The concrete strength and finish replace `standard-social` when another choice is selected. A successful finalization removes other recognized outputs sharing the same source stem, including versioned render groups and diagnose-only reports, but never deletes the source DNG or unrelated files. The original DNG must remain byte-for-byte unchanged. The runner writes all outputs through non-dot-prefixed temporary files and publishes them only after they are complete. Published files must be visible in Finder and other file managers; on macOS the runner clears and verifies the absence of `UF_HIDDEN`, failing the render instead of reporting success if a final output remains hidden.
 
 The runner checks the final encoded JPEG with a full-image luminance histogram and reports black clipping, deep-shadow coverage, bright-highlight coverage, white clipping, and 1st/50th/99th-percentile luma. See [references/rendering-model.md](references/rendering-model.md) for thresholds.
 
@@ -72,6 +73,7 @@ The runner checks the final encoded JPEG with a full-image luminance histogram a
 - Stop and report the runner's error for a damaged file, non-DNG input, non-Apple camera, non-iPhone model, missing 64-bit Python 3.9+, dependency failure, or unsupported LibRaw file.
 - Do not silently fall back to the embedded JPEG preview, Apple Photos, Capture One, or a generative image tool.
 - If one item in a batch fails, report that item separately; successful items remain valid.
+- Never clean candidates after a failed render, failed source-hash check, or incomplete final group.
 - Explain that ProRAW already contains Apple multi-frame computation. This workflow reduces its visible tone, color, and microcontrast character but cannot reconstruct an untouched single sensor frame.
 
 Read [references/rendering-model.md](references/rendering-model.md) only when changing presets or model rules, interpreting DNG diagnostics, diagnosing color differences, reviewing dependencies, or explaining technical limitations.

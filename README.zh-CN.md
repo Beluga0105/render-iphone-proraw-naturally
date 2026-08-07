@@ -121,9 +121,10 @@ python3 scripts/run.py "/绝对路径/photo.dng" --diagnose-only
 --overwrite
 --keep-gps
 --diagnose-only
+--finalize
 ```
 
-不使用 `--overwrite` 时，已有结果不会被覆盖，新文件会自动增加 `-v2`、`-v3` 等后缀。
+不使用 `--finalize` 时，显影结果属于对比候选；已有结果不会被覆盖，新文件会自动增加 `-v2`、`-v3` 等后缀。目视确认后，用选定的强度和完成方式重新运行并加入 `--finalize`，发布唯一一组规范命名的 JPEG + TIFF + JSON，同时只清理同一源文件的已识别输出。
 
 ## 输出
 
@@ -139,7 +140,7 @@ photo-natural-standard-social-diagnostic.json
 - **TIFF：** 完成版 16-bit Display P3 母版
 - **诊断 JSON：** 相机元数据、ProRAW 标签摘要、显影决策、亮度统计、饱和度统计和 `quality_check`
 
-原始 DNG 保持不变。输出先写入临时文件，只有完整处理成功后才正式发布到目标目录。在 macOS 上，发布过程会清除原子临时文件可能遗留的隐藏标志，确保 JPEG、TIFF 和 JSON 在 Finder 中正常可见。
+原始 DNG 保持不变。输出先写入非点号开头的临时文件，只有完整处理成功后才正式发布到目标目录。在 macOS 上，发布过程会清除并验证 `UF_HIDDEN`；如果最终文件仍在 Finder 中隐藏，显影会直接报错，不再误报成功。
 
 ## 隐私与内容完整性
 
