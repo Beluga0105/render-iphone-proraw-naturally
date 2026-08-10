@@ -11,11 +11,11 @@ Apple ProRAW is already a computational RAW format. The pipeline can reshape its
 - Decoder: rawpy 0.27.0 / LibRaw.
 - White balance: camera/as-shot.
 - Automatic white balance: off.
-- Exposure normalization: deterministic LibRaw global auto-bright at a 1% highlight threshold, followed by a fixed preset-level linear exposure bias, an optional preview-guided global midtone lift, and an optional global shadow anchor; no local or content-aware HDR adjustment.
+- Exposure normalization: deterministic LibRaw global auto-bright at a 1% highlight threshold, followed by a fixed preset-level linear exposure bias, an optional bounded region-aware shadow recovery, an optional preview-guided global midtone lift, and an optional global shadow anchor.
 - Highlight handling: blend.
 - Working data: 16-bit linear P3 D65.
 - Output encoding: standard sRGB transfer function.
-- Rendering: deterministic global color and tone operations only.
+- Rendering: deterministic color and tone operations. The only spatially varying stage is the non-semantic regional shadow mask described below; it does not generate, classify, replace, or reconstruct content.
 
 ## Presets
 
@@ -27,13 +27,23 @@ All tone curves use x control points `[0.00, 0.08, 0.20, 0.45, 0.73, 0.90, 1.00]
 | standard | -0.180 | 0.055 | 1.020 | 0.000 | 1.025 | `[0.000, 0.022, 0.125, 0.430, 0.770, 0.925, 0.990]` |
 | strong | -0.450 | 0.110 | 1.000 | 0.000 | 1.045 | `[0.000, 0.012, 0.075, 0.335, 0.690, 0.890, 0.982]` |
 
-Apply the preset exposure bias in linear P3. After display encoding, compress high chroma around P3 luminance and apply brightness, contrast, and the tone curve to luminance rather than independently to RGB channels. Rescale RGB by the luminance ratio to preserve hue relationships. The `strong` curve deliberately restores lower-middle-tone density and highlight separation for scenes where the standard rendering still looks HDR-flat. Do not apply local operators.
+Apply the preset exposure bias in linear P3. After display encoding, compress high chroma around P3 luminance and apply brightness, contrast, and the tone curve to luminance rather than independently to RGB channels. Rescale RGB by the luminance ratio to preserve hue relationships. The `strong` curve deliberately restores lower-middle-tone density and highlight separation for scenes where the standard rendering still looks HDR-flat.
+
+## Regional shadow recovery
+
+The default `--regional-shadows auto` addresses bright-sky/backlit scenes whose upper region is well exposed while the ground or foreground remains too dense. Build a luminance guide no larger than 320 pixels on its longest edge, blur it with a 5-pixel Gaussian radius, and use only luminance plus vertical position. Do not use semantic segmentation, object recognition, generative masks, preview pixels, or scene reconstruction.
+
+Auto activation requires all of the following: upper-region P60 at least `0.38`, lower-region P50 at most `0.30`, an upper/lower gap of at least `0.14`, at least `5%` bright guide area at or above `0.52`, and at least `12%` recoverable guide area between `0.035` and `0.30`. This prevents small lamps in night scenes, evenly lit scenes, and bright snow foregrounds from triggering the module. `--regional-shadows on` bypasses only the scene-level activation decision; all pixel-level safety gates remain active. `off` retains the legacy global midtone decision path.
+
+Construct a soft recovery weight from guide darkness (`0.14` to `0.34`) and a lower-frame prior that ramps from `0.18` to `0.58` of image height. Suppress bright upper-frame pixels using a sky/highlight protection ramp from `0.22` to `0.48`. At full user strength, cap the rational luminance lift at `0.65 EV`; preserve true black with a toe gate from `0.018` to `0.085`, fade the effect out from `0.34` to `0.62`, and rescale RGB together to preserve hue. Apply the guide in bounded row chunks so 48 MP inputs do not require a full-resolution mask allocation.
+
+When regional recovery applies, skip preview-guided global midtone lifting so a normal sky is not changed merely to open the foreground. Continue to run the global shadow anchor only when its independent black-point criteria require it. Record activation thresholds, affected area, maximum actual lift, protected-region mean luminance change, upper-region mean/max change, and before/after percentiles in `regional_shadow_recovery`. Visual review must reject halos, lifted true blacks, or visible sky drift.
 
 ## Scene midtone adaptation
 
 Bright sky, cloud, or backlight can dominate LibRaw's global auto-bright decision and leave the photographed ground or foreground too dense even when highlights are intact. After the preset tone curve, compare the rendered global median luminance with the embedded preview's global median. Activate a deterministic luminance-only lift only when the preview median is at least `0.25`, the preview-to-render gap is at least `0.06`, the rendered P01-to-P99 span is at least `0.75`, and rendered P99 is at least `0.80`.
 
-Set the candidate target from 70% of the preview median gap and a bounded positive `BaselineExposure` contribution. Clamp positive metadata input to `0.75 EV`, use it only as an additional target signal, never let a negative value force darkening, keep the target at least `0.035` below the preview median, and cap absolute median lift at `0.17`. Solve a single global gain against sampled luminance. Preserve the toe with a smooth gate from `0.015` to `0.12`, fade the lift out from `0.60` to `0.97`, and cap gain at `4.0`. This opens dense midtones without copying preview pixels, applying local masks, or sacrificing the bright-sky shoulder.
+Set the candidate target from 70% of the preview median gap and a bounded positive `BaselineExposure` contribution. Clamp positive metadata input to `0.75 EV`, use it only as an additional target signal, never let a negative value force darkening, keep the target at least `0.035` below the preview median, and cap absolute median lift at `0.17`. Solve a single global gain against sampled luminance. Preserve the toe with a smooth gate from `0.015` to `0.12`, fade the lift out from `0.60` to `0.97`, and cap gain at `4.0`. This opens dense midtones without copying preview pixels or sacrificing the bright-sky shoulder. It runs only when regional shadow recovery did not apply.
 
 Record the preview and rendered percentiles, BaselineExposure contribution, selected target, gain, curve limit, activation reason, and before/after statistics in `midtone_adaptation`. Failure to read a preview is non-fatal and must result in no midtone adaptation.
 

@@ -13,6 +13,7 @@ The skill builds a restrained natural-camera rendering from the RAW image, then 
 - decodes pixels from the ProRAW DNG rather than copying the embedded preview
 - preserves the original composition, faces, objects, signs, and text
 - avoids HDR-like lifted shadows, harsh microcontrast, neon color, and brittle highlights
+- detects bright-sky/dark-foreground scenes and opens only recoverable dark regions with sky/highlight protection
 - exports an 8-bit sRGB JPEG and a 16-bit Display P3 TIFF
 - writes a structured diagnostic JSON with ProRAW metadata and exposure checks
 - supports individual files, multiple files, and immediate-child batch folders
@@ -32,6 +33,13 @@ The skill builds a restrained natural-camera rendering from the RAW image, then 
 
 - `social`: the default sharing-ready finish with restrained perceptual vibrance and hue-preserving sRGB gamut compression
 - `neutral`: a conservative base for further editing
+
+### Regional shadows
+
+- `auto`: default; activates only for a well-exposed upper region with a substantially darker foreground
+- `off`: disables regional recovery and allows the legacy global midtone adaptation path
+- `on`: forces the bounded regional mask while retaining sky, highlight, and true-black protection
+- `--regional-shadow-strength 0..1`: scales the recovery up to a maximum of `0.65 EV`
 
 ## Installation
 
@@ -117,6 +125,8 @@ Useful options:
 ```text
 --strength auto|light|standard|strong
 --finish neutral|social
+--regional-shadows auto|off|on
+--regional-shadow-strength 0..1
 --output-dir /absolute/output/path
 --overwrite
 --keep-gps
@@ -138,7 +148,7 @@ photo-natural-standard-social-diagnostic.json
 
 - **JPEG:** finished 8-bit sRGB, suitable for direct sharing
 - **TIFF:** finished 16-bit Display P3 master
-- **Diagnostic JSON:** camera metadata, ProRAW tag summaries, rendering decision, luminance statistics, saturation statistics, and `quality_check`
+- **Diagnostic JSON:** camera metadata, ProRAW tag summaries, rendering decision, regional-shadow activation and protection metrics, luminance statistics, saturation statistics, and `quality_check`
 
 The original DNG remains unchanged. Output files are written through non-dot-prefixed temporary files and published only after the render completes. On macOS, the publisher clears and verifies the absence of `UF_HIDDEN`; the render fails instead of reporting success if a final output remains hidden in Finder.
 
