@@ -14,6 +14,7 @@ The skill builds a restrained natural-camera rendering from the RAW image, then 
 - preserves the original composition, faces, objects, signs, and text
 - avoids HDR-like lifted shadows, harsh microcontrast, neon color, and brittle highlights
 - detects bright-sky/dark-foreground scenes and opens only recoverable dark regions with sky/highlight protection
+- detects concentrated local overexposure and highlight clipping that full-image averages can miss
 - exports an 8-bit sRGB JPEG and a 16-bit Display P3 TIFF
 - writes a structured diagnostic JSON with ProRAW metadata and exposure checks
 - supports individual files, multiple files, and immediate-child batch folders
@@ -148,7 +149,9 @@ photo-natural-standard-social-diagnostic.json
 
 - **JPEG:** finished 8-bit sRGB, suitable for direct sharing
 - **TIFF:** finished 16-bit Display P3 master
-- **Diagnostic JSON:** camera metadata, ProRAW tag summaries, rendering decision, regional-shadow activation and protection metrics, luminance statistics, saturation statistics, and `quality_check`
+- **Diagnostic JSON:** camera metadata, ProRAW tag summaries, rendering decision, regional-shadow activation and protection metrics, global/local exposure statistics, saturation statistics, and `quality_check`
+
+The final JPEG check includes a local grid. A concentrated lamp, sign, window, reflection, or bright cloud can therefore require review even when its clipped pixels occupy less than 1% of the full image. The diagnostic identifies the highest-risk tile with pixel bounds for full-resolution inspection.
 
 The original DNG remains unchanged. Output files are written through non-dot-prefixed temporary files and published only after the render completes. On macOS, the publisher clears and verifies the absence of `UF_HIDDEN`; the render fails instead of reporting success if a final output remains hidden in Finder.
 

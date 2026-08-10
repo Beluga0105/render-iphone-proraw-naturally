@@ -33,6 +33,12 @@ SHADOW_LUMA_MAX = 20
 HIGHLIGHT_LUMA_MIN = 250
 CLIPPED_BLACK_LUMA_MAX = 1
 CLIPPED_WHITE_LUMA_MIN = 254
+LOCAL_HIGHLIGHT_GRID_LONG_SIDE = 16
+LOCAL_HIGHLIGHT_GRID_SHORT_SIDE = 12
+LOCAL_NEAR_WHITE_LUMA_MIN = 235
+LOCAL_NEAR_WHITE_REVIEW_PERCENT = 20.0
+LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT = 15.0
+LOCAL_WHITE_CLIP_REVIEW_PERCENT = 5.0
 
 P3_TO_XYZ = np.array([
     [0.4865709486482162, 0.2656676931690931, 0.1982172852343625],
@@ -758,6 +764,116 @@ def _histogram_percentile(histogram: np.ndarray, percentile: float) -> int:
     return int(np.searchsorted(np.cumsum(histogram), target, side="left"))
 
 
+def _local_highlight_check(pixels: np.ndarray) -> dict[str, Any]:
+    """Find concentrated overbright or clipped highlights hidden by global averages."""
+    height, width = pixels.shape[:2]
+    if height >= width:
+        target_rows = LOCAL_HIGHLIGHT_GRID_LONG_SIDE
+        target_columns = LOCAL_HIGHLIGHT_GRID_SHORT_SIDE
+    else:
+        target_rows = LOCAL_HIGHLIGHT_GRID_SHORT_SIDE
+        target_columns = LOCAL_HIGHLIGHT_GRID_LONG_SIDE
+    rows = max(1, min(height, target_rows))
+    columns = max(1, min(width, target_columns))
+    y_edges = np.linspace(0, height, rows + 1, dtype=np.int32)
+    x_edges = np.linspace(0, width, columns + 1, dtype=np.int32)
+
+    peak_bright_percent = 0.0
+    peak_near_white_percent = 0.0
+    peak_white_percent = 0.0
+    peak_channel_percent = 0.0
+    peak_risk = -1.0
+    peak_tile: dict[str, Any] | None = None
+    triggered_tiles = 0
+    for row in range(rows):
+        y0 = int(y_edges[row])
+        y1 = int(y_edges[row + 1])
+        for column in range(columns):
+            x0 = int(x_edges[column])
+            x1 = int(x_edges[column + 1])
+            block = pixels[y0:y1, x0:x1].astype(np.uint16)
+            tile_pixels = max(1, (y1 - y0) * (x1 - x0))
+            luma = (
+                54 * block[..., 0]
+                + 183 * block[..., 1]
+                + 19 * block[..., 2]
+                + 128
+            ) >> 8
+            bright_percent = _percent(
+                int(np.count_nonzero(luma >= HIGHLIGHT_LUMA_MIN)),
+                tile_pixels,
+            )
+            near_white_percent = _percent(
+                int(np.count_nonzero(luma >= LOCAL_NEAR_WHITE_LUMA_MIN)),
+                tile_pixels,
+            )
+            white_percent = _percent(
+                int(np.count_nonzero(luma >= CLIPPED_WHITE_LUMA_MIN)),
+                tile_pixels,
+            )
+            channel_percent = _percent(
+                int(np.count_nonzero(np.any(block >= CLIPPED_WHITE_LUMA_MIN, axis=2))),
+                tile_pixels,
+            )
+            triggered = (
+                near_white_percent >= LOCAL_NEAR_WHITE_REVIEW_PERCENT
+                or bright_percent >= LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT
+                or white_percent >= LOCAL_WHITE_CLIP_REVIEW_PERCENT
+            )
+            if triggered:
+                triggered_tiles += 1
+            risk = max(
+                near_white_percent / LOCAL_NEAR_WHITE_REVIEW_PERCENT,
+                bright_percent / LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT,
+                white_percent / LOCAL_WHITE_CLIP_REVIEW_PERCENT,
+            )
+            if risk > peak_risk:
+                peak_risk = risk
+                peak_tile = {
+                    "row": row,
+                    "column": column,
+                    "bounds_pixels": {
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1,
+                    },
+                    "bounds_fraction": {
+                        "x0": round(x0 / width, 6),
+                        "y0": round(y0 / height, 6),
+                        "x1": round(x1 / width, 6),
+                        "y1": round(y1 / height, 6),
+                    },
+                    "near_white_percent": near_white_percent,
+                    "bright_highlight_percent": bright_percent,
+                    "white_clip_percent": white_percent,
+                    "any_channel_clip_percent": channel_percent,
+                    "luma_p99": int(np.percentile(luma, 99.0)),
+                }
+            peak_near_white_percent = max(peak_near_white_percent, near_white_percent)
+            peak_bright_percent = max(peak_bright_percent, bright_percent)
+            peak_white_percent = max(peak_white_percent, white_percent)
+            peak_channel_percent = max(peak_channel_percent, channel_percent)
+
+    return {
+        "method": "fixed_grid_local_highlight_exposure",
+        "grid": {"rows": rows, "columns": columns},
+        "thresholds": {
+            "near_white_luma_min": LOCAL_NEAR_WHITE_LUMA_MIN,
+            "near_white_percent": LOCAL_NEAR_WHITE_REVIEW_PERCENT,
+            "bright_highlight_percent": LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT,
+            "white_clip_percent": LOCAL_WHITE_CLIP_REVIEW_PERCENT,
+        },
+        "triggered": triggered_tiles > 0,
+        "triggered_tile_count": triggered_tiles,
+        "peak_near_white_percent": round(peak_near_white_percent, 4),
+        "peak_bright_highlight_percent": round(peak_bright_percent, 4),
+        "peak_white_clip_percent": round(peak_white_percent, 4),
+        "peak_any_channel_clip_percent": round(peak_channel_percent, 4),
+        "peak_tile": peak_tile,
+    }
+
+
 def _analyze_final_jpeg(
     path: Path,
     midtone_adaptation: dict[str, Any] | None = None,
@@ -802,6 +918,8 @@ def _analyze_final_jpeg(
             "p90": _histogram_percentile(saturation_histogram, 0.90),
         },
     }
+    local_highlight_check = _local_highlight_check(pixels)
+    metrics["local_highlight_check"] = local_highlight_check
 
     warnings: list[str] = []
     median = metrics["luma_percentiles_8bit"]["p50"]
@@ -814,6 +932,10 @@ def _analyze_final_jpeg(
     if metrics["white_clip_percent"] >= 1.0 or metrics["bright_highlight_percent"] >= 5.0:
         warnings.append(
             "possible_highlight_clipping: inspect bright areas for lost texture before delivery"
+        )
+    if local_highlight_check["triggered"]:
+        warnings.append(
+            "possible_local_overexposure: concentrated near-white or clipped region exceeds local thresholds; inspect peak_tile before delivery"
         )
     if midtone_adaptation and midtone_adaptation.get("preview", {}).get("available"):
         reference_p50 = float(midtone_adaptation["preview"]["metrics"]["p50"])
