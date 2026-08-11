@@ -18,7 +18,7 @@ from typing import Any, Iterable
 import numpy as np
 import rawpy
 import tifffile
-from PIL import ExifTags, Image, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageFilter, UnidentifiedImageError
 
 from dng_diagnostics import diagnose_proraw
 
@@ -33,6 +33,12 @@ SHADOW_LUMA_MAX = 20
 HIGHLIGHT_LUMA_MIN = 250
 CLIPPED_BLACK_LUMA_MAX = 1
 CLIPPED_WHITE_LUMA_MIN = 254
+LOCAL_HIGHLIGHT_GRID_LONG_SIDE = 16
+LOCAL_HIGHLIGHT_GRID_SHORT_SIDE = 12
+LOCAL_NEAR_WHITE_LUMA_MIN = 235
+LOCAL_NEAR_WHITE_REVIEW_PERCENT = 20.0
+LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT = 15.0
+LOCAL_WHITE_CLIP_REVIEW_PERCENT = 5.0
 
 P3_TO_XYZ = np.array([
     [0.4865709486482162, 0.2656676931690931, 0.1982172852343625],
@@ -100,6 +106,29 @@ MIDTONE_HIGHLIGHT_END = 0.97
 MIDTONE_SEARCH_STEPS = 18
 MIDTONE_UNDEREXPOSURE_RATIO = 0.75
 MIDTONE_UNDEREXPOSURE_GAP = 0.08
+REGIONAL_GUIDE_MAX_DIMENSION = 320
+REGIONAL_GUIDE_BLUR_RADIUS = 5.0
+REGIONAL_UPPER_FRACTION = 0.45
+REGIONAL_LOWER_START = 0.35
+REGIONAL_MIN_UPPER_P60 = 0.38
+REGIONAL_MAX_LOWER_P50 = 0.30
+REGIONAL_MIN_UPPER_LOWER_GAP = 0.14
+REGIONAL_MIN_BRIGHT_AREA_PERCENT = 5.0
+REGIONAL_MIN_RECOVERABLE_AREA_PERCENT = 12.0
+REGIONAL_BRIGHT_LUMA = 0.52
+REGIONAL_RECOVERABLE_MIN_LUMA = 0.035
+REGIONAL_RECOVERABLE_MAX_LUMA = 0.30
+REGIONAL_GUIDE_DARK_START = 0.14
+REGIONAL_GUIDE_DARK_END = 0.34
+REGIONAL_GROUND_PRIOR_START = 0.18
+REGIONAL_GROUND_PRIOR_END = 0.58
+REGIONAL_SKY_PROTECT_START = 0.22
+REGIONAL_SKY_PROTECT_END = 0.48
+REGIONAL_SHADOW_START = 0.018
+REGIONAL_SHADOW_END = 0.085
+REGIONAL_HIGHLIGHT_START = 0.34
+REGIONAL_HIGHLIGHT_END = 0.62
+REGIONAL_MAX_LIFT_EV = 0.65
 
 
 class RenderError(RuntimeError):
@@ -308,6 +337,208 @@ def _smoothstep(values: np.ndarray) -> np.ndarray:
     return values * values * (3.0 - 2.0 * values)
 
 
+def _regional_guide_luma(encoded_p3: np.ndarray) -> np.ndarray:
+    """Build a small, blurred luminance guide without allocating a full-size mask."""
+    height, width = encoded_p3.shape[:2]
+    stride = max(1, int(math.ceil(max(height, width) / REGIONAL_GUIDE_MAX_DIMENSION)))
+    sampled = encoded_p3[::stride, ::stride].astype(np.float32, copy=False)
+    luma = np.sum(sampled * P3_LUMA, axis=2)
+    guide_image = Image.fromarray(
+        np.rint(np.clip(luma, 0.0, 1.0) * 255.0).astype(np.uint8)
+    )
+    guide_image = guide_image.filter(ImageFilter.GaussianBlur(REGIONAL_GUIDE_BLUR_RADIUS))
+    return np.asarray(guide_image, dtype=np.float32) * (1.0 / 255.0)
+
+
+def _resize_guide_rows(
+    guide: np.ndarray,
+    output_height: int,
+    output_width: int,
+    row_start: int,
+    row_end: int,
+) -> np.ndarray:
+    """Bilinearly resize guide rows while keeping memory bounded for 48 MP inputs."""
+    guide_height, guide_width = guide.shape
+    x = np.linspace(0.0, max(0, guide_width - 1), output_width, dtype=np.float32)
+    x0 = np.floor(x).astype(np.int32)
+    x1 = np.minimum(x0 + 1, guide_width - 1)
+    wx = x - x0
+    y = np.linspace(0.0, max(0, guide_height - 1), output_height, dtype=np.float32)[row_start:row_end]
+    y0 = np.floor(y).astype(np.int32)
+    y1 = np.minimum(y0 + 1, guide_height - 1)
+    wy = (y - y0)[:, None]
+    top = guide[y0[:, None], x0[None, :]] * (1.0 - wx)[None, :]
+    top += guide[y0[:, None], x1[None, :]] * wx[None, :]
+    bottom = guide[y1[:, None], x0[None, :]] * (1.0 - wx)[None, :]
+    bottom += guide[y1[:, None], x1[None, :]] * wx[None, :]
+    return top * (1.0 - wy) + bottom * wy
+
+
+def _regional_lift_luma(luma: np.ndarray, gain: float) -> np.ndarray:
+    return np.divide(gain * luma, 1.0 + (gain - 1.0) * luma)
+
+
+def _recover_regional_shadows_inplace(
+    encoded_p3: np.ndarray,
+    mode: str,
+    strength: float,
+) -> dict[str, Any]:
+    """Lift dense non-sky regions with a smooth deterministic luminance mask."""
+    before = _sample_luma_percentiles(encoded_p3, P3_LUMA)
+    report: dict[str, Any] = {
+        "method": "region_guided_luminance_shadow_recovery",
+        "requested_mode": mode,
+        "strength": round(float(strength), 4),
+        "applied": False,
+        "sky_protected": True,
+        "before": before,
+    }
+    if mode == "off" or strength <= 0.0:
+        report["reason"] = "disabled"
+        report["after"] = before
+        return report
+
+    guide_luma = _regional_guide_luma(encoded_p3)
+    guide_height, guide_width = guide_luma.shape
+    upper_end = max(1, int(round(guide_height * REGIONAL_UPPER_FRACTION)))
+    lower_start = min(guide_height - 1, int(round(guide_height * REGIONAL_LOWER_START)))
+    upper = guide_luma[:upper_end]
+    lower = guide_luma[lower_start:]
+    upper_p60 = float(np.percentile(upper, 60.0))
+    lower_p50 = float(np.percentile(lower, 50.0))
+    upper_lower_gap = upper_p60 - lower_p50
+    bright_area_percent = float(np.mean(guide_luma >= REGIONAL_BRIGHT_LUMA) * 100.0)
+
+    vertical = np.linspace(0.0, 1.0, guide_height, dtype=np.float32)[:, None]
+    ground_prior = _smoothstep(
+        (vertical - REGIONAL_GROUND_PRIOR_START)
+        / (REGIONAL_GROUND_PRIOR_END - REGIONAL_GROUND_PRIOR_START)
+    )
+    local_darkness = 1.0 - _smoothstep(
+        (guide_luma - REGIONAL_GUIDE_DARK_START)
+        / (REGIONAL_GUIDE_DARK_END - REGIONAL_GUIDE_DARK_START)
+    )
+    upper_weight = 1.0 - _smoothstep(
+        (vertical - REGIONAL_GROUND_PRIOR_START)
+        / (REGIONAL_GROUND_PRIOR_END - REGIONAL_GROUND_PRIOR_START)
+    )
+    sky_brightness = _smoothstep(
+        (guide_luma - REGIONAL_SKY_PROTECT_START)
+        / (REGIONAL_SKY_PROTECT_END - REGIONAL_SKY_PROTECT_START)
+    )
+    sky_protection = upper_weight * sky_brightness
+    guide_mask = np.clip(local_darkness * ground_prior * (1.0 - sky_protection), 0.0, 1.0)
+    recoverable = (
+        (guide_luma >= REGIONAL_RECOVERABLE_MIN_LUMA)
+        & (guide_luma <= REGIONAL_RECOVERABLE_MAX_LUMA)
+        & (ground_prior >= 0.25)
+    )
+    recoverable_area_percent = float(np.mean(recoverable) * 100.0)
+    decision = {
+        "upper_p60": round(upper_p60, 6),
+        "lower_p50": round(lower_p50, 6),
+        "upper_lower_gap": round(upper_lower_gap, 6),
+        "bright_area_percent": round(bright_area_percent, 4),
+        "recoverable_shadow_area_percent": round(recoverable_area_percent, 4),
+        "minimum_upper_p60": REGIONAL_MIN_UPPER_P60,
+        "maximum_lower_p50": REGIONAL_MAX_LOWER_P50,
+        "minimum_upper_lower_gap": REGIONAL_MIN_UPPER_LOWER_GAP,
+        "minimum_bright_area_percent": REGIONAL_MIN_BRIGHT_AREA_PERCENT,
+        "minimum_recoverable_shadow_area_percent": REGIONAL_MIN_RECOVERABLE_AREA_PERCENT,
+        "maximum_lift_ev": round(REGIONAL_MAX_LIFT_EV * strength, 6),
+    }
+    report["decision"] = decision
+
+    automatic_match = (
+        upper_p60 >= REGIONAL_MIN_UPPER_P60
+        and lower_p50 <= REGIONAL_MAX_LOWER_P50
+        and upper_lower_gap >= REGIONAL_MIN_UPPER_LOWER_GAP
+        and bright_area_percent >= REGIONAL_MIN_BRIGHT_AREA_PERCENT
+        and recoverable_area_percent >= REGIONAL_MIN_RECOVERABLE_AREA_PERCENT
+    )
+    if mode == "auto" and not automatic_match:
+        report["reason"] = "scene_does_not_need_regional_shadow_recovery"
+        report["after"] = before
+        return report
+    if float(np.max(guide_mask)) <= 1e-4:
+        report["reason"] = "no_safe_regional_mask"
+        report["after"] = before
+        return report
+
+    gain = float(2.0 ** REGIONAL_MAX_LIFT_EV)
+    affected_pixels = 0
+    protected_pixels = 0
+    protected_luma_before = 0.0
+    protected_luma_after = 0.0
+    upper_luma_before = 0.0
+    upper_luma_after = 0.0
+    upper_pixels = 0
+    upper_max_change = 0.0
+    maximum_actual_ratio = 1.0
+    height, width = encoded_p3.shape[:2]
+    for start in range(0, height, CHUNK_ROWS):
+        end = min(height, start + CHUNK_ROWS)
+        block = encoded_p3[start:end]
+        luma = np.sum(block * P3_LUMA, axis=2, keepdims=True)
+        regional_weight = _resize_guide_rows(guide_mask, height, width, start, end)[..., None]
+        shadow_gate = _smoothstep(
+            (luma - REGIONAL_SHADOW_START) / (REGIONAL_SHADOW_END - REGIONAL_SHADOW_START)
+        )
+        highlight_gate = 1.0 - _smoothstep(
+            (luma - REGIONAL_HIGHLIGHT_START) / (REGIONAL_HIGHLIGHT_END - REGIONAL_HIGHLIGHT_START)
+        )
+        mask = regional_weight * shadow_gate * highlight_gate * strength
+        lifted_luma = _regional_lift_luma(luma, gain)
+        target_luma = luma + (lifted_luma - luma) * mask
+        ratio = np.divide(target_luma, np.maximum(luma, 1e-6))
+        maximum_actual_ratio = max(maximum_actual_ratio, float(np.max(ratio)))
+        affected_pixels += int(np.count_nonzero(mask[..., 0] >= 0.02))
+        protected = (luma[..., 0] >= REGIONAL_HIGHLIGHT_END) | (regional_weight[..., 0] <= 1e-4)
+        protected_pixels += int(np.count_nonzero(protected))
+        protected_luma_before += float(np.sum(luma[..., 0][protected], dtype=np.float64))
+        protected_luma_after += float(np.sum(target_luma[..., 0][protected], dtype=np.float64))
+        upper_end_row = min(end, int(round(height * REGIONAL_UPPER_FRACTION)))
+        if upper_end_row > start:
+            upper_count = upper_end_row - start
+            upper_before = luma[:upper_count, :, 0]
+            upper_after = target_luma[:upper_count, :, 0]
+            upper_pixels += int(upper_before.size)
+            upper_luma_before += float(np.sum(upper_before, dtype=np.float64))
+            upper_luma_after += float(np.sum(upper_after, dtype=np.float64))
+            upper_max_change = max(
+                upper_max_change,
+                float(np.max(np.abs(upper_after - upper_before))),
+            )
+        block *= ratio
+        np.clip(block, 0.0, 1.0, out=block)
+
+    total_pixels = height * width
+    protected_delta = 0.0
+    if protected_pixels:
+        protected_delta = (
+            protected_luma_after - protected_luma_before
+        ) / protected_pixels
+    upper_delta = 0.0
+    if upper_pixels:
+        upper_delta = (upper_luma_after - upper_luma_before) / upper_pixels
+    report.update({
+        "applied": True,
+        "reason": (
+            "well_exposed_upper_region_with_dense_foreground"
+            if automatic_match
+            else "forced_regional_shadow_recovery"
+        ),
+        "gain": round(gain, 6),
+        "affected_area_percent": round(affected_pixels * 100.0 / total_pixels, 4),
+        "maximum_actual_lift_ev": round(math.log2(maximum_actual_ratio), 6),
+        "protected_region_mean_luma_change": round(protected_delta, 8),
+        "upper_region_mean_luma_change": round(upper_delta, 8),
+        "upper_region_max_luma_change": round(upper_max_change, 8),
+        "after": _sample_luma_percentiles(encoded_p3, P3_LUMA),
+    })
+    return report
+
+
 def _midtone_lift_luma(luma: np.ndarray, gain: float) -> np.ndarray:
     lifted = np.divide(
         gain * luma,
@@ -326,6 +557,7 @@ def _adapt_scene_midtones_inplace(
     encoded_p3: np.ndarray,
     preview_contrast: dict[str, Any],
     baseline_exposure_ev: float | None,
+    regional_shadow_recovery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     before = _sample_luma_percentiles(encoded_p3, P3_LUMA)
     report: dict[str, Any] = {
@@ -334,6 +566,10 @@ def _adapt_scene_midtones_inplace(
         "preview": preview_contrast,
         "before": before,
     }
+    if regional_shadow_recovery and regional_shadow_recovery.get("applied"):
+        report["reason"] = "regional_shadow_recovery_already_opened_dense_regions"
+        report["after"] = before
+        return report
     if not preview_contrast.get("available"):
         report["reason"] = "embedded_preview_unavailable"
         report["after"] = before
@@ -528,6 +764,116 @@ def _histogram_percentile(histogram: np.ndarray, percentile: float) -> int:
     return int(np.searchsorted(np.cumsum(histogram), target, side="left"))
 
 
+def _local_highlight_check(pixels: np.ndarray) -> dict[str, Any]:
+    """Find concentrated overbright or clipped highlights hidden by global averages."""
+    height, width = pixels.shape[:2]
+    if height >= width:
+        target_rows = LOCAL_HIGHLIGHT_GRID_LONG_SIDE
+        target_columns = LOCAL_HIGHLIGHT_GRID_SHORT_SIDE
+    else:
+        target_rows = LOCAL_HIGHLIGHT_GRID_SHORT_SIDE
+        target_columns = LOCAL_HIGHLIGHT_GRID_LONG_SIDE
+    rows = max(1, min(height, target_rows))
+    columns = max(1, min(width, target_columns))
+    y_edges = np.linspace(0, height, rows + 1, dtype=np.int32)
+    x_edges = np.linspace(0, width, columns + 1, dtype=np.int32)
+
+    peak_bright_percent = 0.0
+    peak_near_white_percent = 0.0
+    peak_white_percent = 0.0
+    peak_channel_percent = 0.0
+    peak_risk = -1.0
+    peak_tile: dict[str, Any] | None = None
+    triggered_tiles = 0
+    for row in range(rows):
+        y0 = int(y_edges[row])
+        y1 = int(y_edges[row + 1])
+        for column in range(columns):
+            x0 = int(x_edges[column])
+            x1 = int(x_edges[column + 1])
+            block = pixels[y0:y1, x0:x1].astype(np.uint16)
+            tile_pixels = max(1, (y1 - y0) * (x1 - x0))
+            luma = (
+                54 * block[..., 0]
+                + 183 * block[..., 1]
+                + 19 * block[..., 2]
+                + 128
+            ) >> 8
+            bright_percent = _percent(
+                int(np.count_nonzero(luma >= HIGHLIGHT_LUMA_MIN)),
+                tile_pixels,
+            )
+            near_white_percent = _percent(
+                int(np.count_nonzero(luma >= LOCAL_NEAR_WHITE_LUMA_MIN)),
+                tile_pixels,
+            )
+            white_percent = _percent(
+                int(np.count_nonzero(luma >= CLIPPED_WHITE_LUMA_MIN)),
+                tile_pixels,
+            )
+            channel_percent = _percent(
+                int(np.count_nonzero(np.any(block >= CLIPPED_WHITE_LUMA_MIN, axis=2))),
+                tile_pixels,
+            )
+            triggered = (
+                near_white_percent >= LOCAL_NEAR_WHITE_REVIEW_PERCENT
+                or bright_percent >= LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT
+                or white_percent >= LOCAL_WHITE_CLIP_REVIEW_PERCENT
+            )
+            if triggered:
+                triggered_tiles += 1
+            risk = max(
+                near_white_percent / LOCAL_NEAR_WHITE_REVIEW_PERCENT,
+                bright_percent / LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT,
+                white_percent / LOCAL_WHITE_CLIP_REVIEW_PERCENT,
+            )
+            if risk > peak_risk:
+                peak_risk = risk
+                peak_tile = {
+                    "row": row,
+                    "column": column,
+                    "bounds_pixels": {
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1,
+                    },
+                    "bounds_fraction": {
+                        "x0": round(x0 / width, 6),
+                        "y0": round(y0 / height, 6),
+                        "x1": round(x1 / width, 6),
+                        "y1": round(y1 / height, 6),
+                    },
+                    "near_white_percent": near_white_percent,
+                    "bright_highlight_percent": bright_percent,
+                    "white_clip_percent": white_percent,
+                    "any_channel_clip_percent": channel_percent,
+                    "luma_p99": int(np.percentile(luma, 99.0)),
+                }
+            peak_near_white_percent = max(peak_near_white_percent, near_white_percent)
+            peak_bright_percent = max(peak_bright_percent, bright_percent)
+            peak_white_percent = max(peak_white_percent, white_percent)
+            peak_channel_percent = max(peak_channel_percent, channel_percent)
+
+    return {
+        "method": "fixed_grid_local_highlight_exposure",
+        "grid": {"rows": rows, "columns": columns},
+        "thresholds": {
+            "near_white_luma_min": LOCAL_NEAR_WHITE_LUMA_MIN,
+            "near_white_percent": LOCAL_NEAR_WHITE_REVIEW_PERCENT,
+            "bright_highlight_percent": LOCAL_BRIGHT_HIGHLIGHT_REVIEW_PERCENT,
+            "white_clip_percent": LOCAL_WHITE_CLIP_REVIEW_PERCENT,
+        },
+        "triggered": triggered_tiles > 0,
+        "triggered_tile_count": triggered_tiles,
+        "peak_near_white_percent": round(peak_near_white_percent, 4),
+        "peak_bright_highlight_percent": round(peak_bright_percent, 4),
+        "peak_white_clip_percent": round(peak_white_percent, 4),
+        "peak_any_channel_clip_percent": round(peak_channel_percent, 4),
+        "peak_tile": peak_tile,
+    }
+
+
 def _analyze_final_jpeg(
     path: Path,
     midtone_adaptation: dict[str, Any] | None = None,
@@ -572,6 +918,8 @@ def _analyze_final_jpeg(
             "p90": _histogram_percentile(saturation_histogram, 0.90),
         },
     }
+    local_highlight_check = _local_highlight_check(pixels)
+    metrics["local_highlight_check"] = local_highlight_check
 
     warnings: list[str] = []
     median = metrics["luma_percentiles_8bit"]["p50"]
@@ -584,6 +932,10 @@ def _analyze_final_jpeg(
     if metrics["white_clip_percent"] >= 1.0 or metrics["bright_highlight_percent"] >= 5.0:
         warnings.append(
             "possible_highlight_clipping: inspect bright areas for lost texture before delivery"
+        )
+    if local_highlight_check["triggered"]:
+        warnings.append(
+            "possible_local_overexposure: concentrated near-white or clipped region exceeds local thresholds; inspect peak_tile before delivery"
         )
     if midtone_adaptation and midtone_adaptation.get("preview", {}).get("available"):
         reference_p50 = float(midtone_adaptation["preview"]["metrics"]["p50"])
@@ -750,6 +1102,8 @@ def _render_one(
     overwrite: bool,
     keep_gps: bool,
     finalize: bool,
+    regional_shadows: str,
+    regional_shadow_strength: float,
 ) -> dict[str, Any]:
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
         raise RenderError("Only Apple ProRAW .dng inputs are accepted; JPEG and HEIC are not RAW inputs.")
@@ -777,6 +1131,10 @@ def _render_one(
         "mode": "final" if finalize else "candidate",
         "cleanup_other_variants": finalize,
     }
+    diagnostic["regional_shadow_control"] = {
+        "mode": regional_shadows,
+        "strength": round(regional_shadow_strength, 4),
+    }
 
     try:
         with rawpy.imread(str(path)) as raw:
@@ -801,6 +1159,11 @@ def _render_one(
     for start in range(0, encoded_p3.shape[0], CHUNK_ROWS):
         _srgb_oetf_inplace(encoded_p3[start:start + CHUNK_ROWS])
     _apply_look_inplace(encoded_p3, PRESETS[strength])
+    regional_shadow_recovery = _recover_regional_shadows_inplace(
+        encoded_p3,
+        regional_shadows,
+        regional_shadow_strength,
+    )
     baseline_exposure = diagnostic.get("baseline_exposure", {})
     baseline_exposure_ev = (
         baseline_exposure.get("ev") if baseline_exposure.get("present") else None
@@ -809,10 +1172,12 @@ def _render_one(
         encoded_p3,
         preview_contrast,
         baseline_exposure_ev,
+        regional_shadow_recovery,
     )
     contrast_preservation = _preserve_scene_contrast_inplace(encoded_p3, preview_contrast)
     _apply_finish_inplace(encoded_p3, FINISH_PRESETS[finish])
     diagnostic["midtone_adaptation"] = midtone_adaptation
+    diagnostic["regional_shadow_recovery"] = regional_shadow_recovery
     diagnostic["scene_contrast_preservation"] = contrast_preservation
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -980,6 +1345,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--keep-gps", action="store_true")
+    parser.add_argument(
+        "--regional-shadows",
+        choices=("auto", "off", "on"),
+        default="auto",
+        help="Apply deterministic region-aware shadow recovery while protecting well-exposed sky and highlights",
+    )
+    parser.add_argument(
+        "--regional-shadow-strength",
+        type=float,
+        default=1.0,
+        metavar="0..1",
+        help="Scale regional shadow recovery from 0 (none) to 1 (maximum 0.65 EV)",
+    )
     parser.add_argument("--diagnose-only", action="store_true", help="Write the ProRAW metadata report without rendering images")
     parser.add_argument(
         "--finalize",
@@ -989,6 +1367,8 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.finalize and args.diagnose_only:
         parser.error("--finalize cannot be combined with --diagnose-only")
+    if not 0.0 <= args.regional_shadow_strength <= 1.0:
+        parser.error("--regional-shadow-strength must be between 0 and 1")
     return args
 
 
@@ -1016,6 +1396,8 @@ def main() -> int:
                     args.overwrite,
                     args.keep_gps,
                     args.finalize,
+                    args.regional_shadows,
+                    args.regional_shadow_strength,
                 )
         except Exception as exc:
             result = {"ok": False, "source": str(path), "error": str(exc)}

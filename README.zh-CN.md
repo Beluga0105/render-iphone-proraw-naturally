@@ -13,6 +13,8 @@
 - 从 ProRAW DNG 解码输出像素，不复制内嵌预览图
 - 保留原始构图、人物、物体、标识和文字
 - 避免阴影被统一抬亮、微反差过硬、颜色发荧光和高光断裂
+- 自动识别“天空正常、前景过暗”的场景，只恢复可安全调整的暗部并保护天空与高光
+- 检查全图平均值容易漏掉的局部过曝和高光剪裁
 - 输出 8-bit sRGB JPEG 和 16-bit Display P3 TIFF
 - 生成包含 ProRAW 元数据与曝光检查的结构化诊断 JSON
 - 支持单文件、多文件和文件夹直属 `.dng` 批处理
@@ -32,6 +34,13 @@
 
 - `social`：默认的直接分享成片；使用克制的感知鲜艳度与保色相的 sRGB 色域压缩
 - `neutral`：适合继续后期处理的保守底片
+
+### 区域阴影恢复
+
+- `auto`：默认；仅在上部区域曝光正常、前景明显偏暗时启用
+- `off`：关闭区域恢复，并允许旧版全局中间调适配路径运行
+- `on`：强制使用受限的区域遮罩，但仍保留天空、高光和纯黑保护
+- `--regional-shadow-strength 0..1`：控制恢复强度，`1` 时最多抬升 `0.65 EV`
 
 ## 安装
 
@@ -117,6 +126,8 @@ python3 scripts/run.py "/绝对路径/photo.dng" --diagnose-only
 ```text
 --strength auto|light|standard|strong
 --finish neutral|social
+--regional-shadows auto|off|on
+--regional-shadow-strength 0..1
 --output-dir /绝对输出路径
 --overwrite
 --keep-gps
@@ -138,7 +149,9 @@ photo-natural-standard-social-diagnostic.json
 
 - **JPEG：** 完成版 8-bit sRGB，可直接分享
 - **TIFF：** 完成版 16-bit Display P3 母版
-- **诊断 JSON：** 相机元数据、ProRAW 标签摘要、显影决策、亮度统计、饱和度统计和 `quality_check`
+- **诊断 JSON：** 相机元数据、ProRAW 标签摘要、显影决策、区域阴影启用与保护指标、全图/局部曝光统计、饱和度统计和 `quality_check`
+
+最终 JPEG 会额外进行局部网格检查。即使灯箱、招牌、窗户、反光或亮云在全图中不足 1%，只要某个区域出现集中剪裁，仍会要求复核；诊断报告会给出风险最高区域的像素坐标，便于按原尺寸检查。
 
 原始 DNG 保持不变。输出先写入非点号开头的临时文件，只有完整处理成功后才正式发布到目标目录。在 macOS 上，发布过程会清除并验证 `UF_HIDDEN`；如果最终文件仍在 Finder 中隐藏，显影会直接报错，不再误报成功。
 
